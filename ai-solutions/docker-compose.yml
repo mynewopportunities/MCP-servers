@@ -1,0 +1,236 @@
+# Deployment Configuration for AI Solutions
+# Docker and Kubernetes deployment for MSP AI services
+
+version: '3.8'
+
+services:
+  # RAG Knowledge Base Service
+  rag-service:
+    build: 
+      context: .
+      dockerfile: Dockerfile.rag
+    ports:
+      - "8001:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - PINECONE_ENVIRONMENT=${PINECONE_ENVIRONMENT}
+      - CHROMA_PERSIST_DIRECTORY=/data/chroma
+    volumes:
+      - rag_data:/data
+      - ./knowledge_base:/app/knowledge_base
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # AI Calling Assistant Service
+  calling-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.calling
+    ports:
+      - "8002:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Intelligent Chatbot Service
+  chatbot-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.chatbot
+    ports:
+      - "8003:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - COMPANY_NAME=${COMPANY_NAME}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://msp_user:${DB_PASSWORD}@postgres:5432/msp_ai
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Main AI Framework Service
+  ai-framework:
+    build:
+      context: .
+      dockerfile: Dockerfile.framework
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - COMPANY_NAME=${COMPANY_NAME}
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://msp_user:${DB_PASSWORD}@postgres:5432/msp_ai
+    depends_on:
+      - redis
+      - postgres
+      - rag-service
+      - calling-service
+      - chatbot-service
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  # PostgreSQL for persistent data
+  postgres:
+    image: postgres:15
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=msp_ai
+      - POSTGRES_USER=msp_user
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  # NGINX Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/ssl/certs
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - ai-framework
+      - rag-service
+      - calling-service
+      - chatbot-service
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  # ELK Stack for logging (optional)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.8.0
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    depends_on:
+      - elasticsearch
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - msp_ai_network
+    restart: unless-stopped
+
+networks:
+  msp_ai_network:
+    driver: bridge
+
+volumes:
+  rag_data:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  elasticsearch_data:
+  nginx_logs:
