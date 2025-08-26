@@ -1,0 +1,464 @@
+# High Availability Database Configuration
+# Multi-master PostgreSQL with automatic failover and load balancing
+
+version: '3.8'
+
+services:
+  # Primary PostgreSQL Master
+  postgres-primary:
+    image: postgres:15
+    container_name: msp-postgres-primary
+    environment:
+      - POSTGRES_DB=msp_enterprise
+      - POSTGRES_USER=msp_admin
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_REPLICATION_USER=replicator
+      - POSTGRES_REPLICATION_PASSWORD=${REPLICATION_PASSWORD}
+      - PGUSER=msp_admin
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./msp_enterprise_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./ha_config/postgresql_primary.conf:/etc/postgresql/postgresql.conf
+      - ./ha_config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./ha_config/recovery.conf:/etc/postgresql/recovery.conf
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msp_admin -d msp_enterprise"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+
+  # PostgreSQL Replica 1
+  postgres-replica1:
+    image: postgres:15
+    container_name: msp-postgres-replica1
+    environment:
+      - POSTGRES_DB=msp_enterprise
+      - POSTGRES_USER=msp_admin
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - PGUSER=msp_admin
+      - POSTGRES_MASTER_SERVICE=postgres-primary
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_replica1_data:/var/lib/postgresql/data
+      - ./ha_config/postgresql_replica.conf:/etc/postgresql/postgresql.conf
+      - ./ha_config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    command: >
+      bash -c "
+      until pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U replicator -v -P -W; do
+        echo 'Waiting for primary to be available...'
+        sleep 5
+      done
+      && echo 'standby_mode = on' >> /var/lib/postgresql/data/recovery.conf
+      && echo 'primary_conninfo = host=postgres-primary port=5432 user=replicator' >> /var/lib/postgresql/data/recovery.conf
+      && postgres -c config_file=/etc/postgresql/postgresql.conf
+      "
+    depends_on:
+      - postgres-primary
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msp_admin -d msp_enterprise"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # PostgreSQL Replica 2
+  postgres-replica2:
+    image: postgres:15
+    container_name: msp-postgres-replica2
+    environment:
+      - POSTGRES_DB=msp_enterprise
+      - POSTGRES_USER=msp_admin
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - PGUSER=msp_admin
+      - POSTGRES_MASTER_SERVICE=postgres-primary
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_replica2_data:/var/lib/postgresql/data
+      - ./ha_config/postgresql_replica.conf:/etc/postgresql/postgresql.conf
+      - ./ha_config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    command: >
+      bash -c "
+      until pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U replicator -v -P -W; do
+        echo 'Waiting for primary to be available...'
+        sleep 5
+      done
+      && echo 'standby_mode = on' >> /var/lib/postgresql/data/recovery.conf
+      && echo 'primary_conninfo = host=postgres-primary port=5432 user=replicator' >> /var/lib/postgresql/data/recovery.conf
+      && postgres -c config_file=/etc/postgresql/postgresql.conf
+      "
+    depends_on:
+      - postgres-primary
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msp_admin -d msp_enterprise"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # PgPool-II for Connection Pooling and Load Balancing
+  pgpool:
+    image: pgpool/pgpool:4.4
+    container_name: msp-pgpool
+    ports:
+      - "5430:9999"
+    environment:
+      - PGPOOL_BACKEND_NODES=0:postgres-primary:5432,1:postgres-replica1:5432,2:postgres-replica2:5432
+      - PGPOOL_POSTGRES_USERNAME=msp_admin
+      - PGPOOL_POSTGRES_PASSWORD=${DB_PASSWORD}
+      - PGPOOL_ADMIN_USERNAME=pgpool_admin
+      - PGPOOL_ADMIN_PASSWORD=${PGPOOL_PASSWORD}
+      - PGPOOL_ENABLE_LOADBALANCING=yes
+      - PGPOOL_MAX_POOL=25
+      - PGPOOL_CHILD_LIFE_TIME=300
+      - PGPOOL_CONNECTION_LIFE_TIME=0
+      - PGPOOL_CLIENT_IDLE_LIMIT=0
+    volumes:
+      - ./ha_config/pgpool.conf:/opt/pgpool/etc/pgpool.conf
+      - ./ha_config/pool_hba.conf:/opt/pgpool/etc/pool_hba.conf
+    depends_on:
+      - postgres-primary
+      - postgres-replica1
+      - postgres-replica2
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "9999"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Redis Cluster for Caching and Session Management
+  redis-node-1:
+    image: redis:7-alpine
+    container_name: msp-redis-1
+    ports:
+      - "7000:7000"
+      - "17000:17000"
+    volumes:
+      - redis_node1_data:/data
+      - ./ha_config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf --port 7000 --cluster-enabled yes --cluster-config-file nodes-7000.conf --cluster-node-timeout 5000 --appendonly yes
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+
+  redis-node-2:
+    image: redis:7-alpine
+    container_name: msp-redis-2
+    ports:
+      - "7001:7001"
+      - "17001:17001"
+    volumes:
+      - redis_node2_data:/data
+      - ./ha_config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf --port 7001 --cluster-enabled yes --cluster-config-file nodes-7001.conf --cluster-node-timeout 5000 --appendonly yes
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+
+  redis-node-3:
+    image: redis:7-alpine
+    container_name: msp-redis-3
+    ports:
+      - "7002:7002"
+      - "17002:17002"
+    volumes:
+      - redis_node3_data:/data
+      - ./ha_config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf --port 7002 --cluster-enabled yes --cluster-config-file nodes-7002.conf --cluster-node-timeout 5000 --appendonly yes
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+
+  # TimescaleDB for Time-Series Data (Monitoring Metrics)
+  timescaledb:
+    image: timescale/timescaledb-ha:pg15-latest
+    container_name: msp-timescaledb
+    environment:
+      - POSTGRES_DB=msp_timeseries
+      - POSTGRES_USER=timescale_admin
+      - POSTGRES_PASSWORD=${TIMESCALE_PASSWORD}
+      - POSTGRES_HOST_AUTH_METHOD=md5
+    ports:
+      - "5435:5432"
+    volumes:
+      - timescaledb_data:/home/postgres/pgdata/data
+      - ./timescale_config/timescaledb.conf:/etc/postgresql/postgresql.conf
+      - ./database/timeseries_schema.sql:/docker-entrypoint-initdb.d/01_timeseries.sql
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U timescale_admin -d msp_timeseries"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # InfluxDB for Additional Time-Series Analytics
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: msp-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=msp_admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUX_PASSWORD}
+      - DOCKER_INFLUXDB_INIT_ORG=MSP-Enterprise
+      - DOCKER_INFLUXDB_INIT_BUCKET=monitoring
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUX_TOKEN}
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ClickHouse for Analytics and Reporting
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: msp-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_DB=msp_analytics
+      - CLICKHOUSE_USER=analytics_admin
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse_config/config.xml:/etc/clickhouse-server/config.xml
+      - ./clickhouse_config/users.xml:/etc/clickhouse-server/users.xml
+      - ./database/analytics_schema.sql:/docker-entrypoint-initdb.d/analytics_schema.sql
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Elasticsearch for Full-Text Search and Log Analytics
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: msp-elasticsearch
+    environment:
+      - cluster.name=msp-cluster
+      - node.name=msp-node-1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - xpack.security.enabled=false
+      - xpack.monitoring.collection.enabled=true
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+      - ./elastic_config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+
+  # HAProxy for Database Load Balancing and Failover
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: msp-haproxy
+    ports:
+      - "5431:5432"  # PostgreSQL load balancer
+      - "8080:8080"  # HAProxy stats
+    volumes:
+      - ./ha_config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    depends_on:
+      - postgres-primary
+      - postgres-replica1
+      - postgres-replica2
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg", "-c"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Consul for Service Discovery and Health Checking
+  consul:
+    image: consul:1.16
+    container_name: msp-consul
+    ports:
+      - "8500:8500"
+      - "8600:8600/udp"
+    environment:
+      - CONSUL_BIND_INTERFACE=eth0
+    volumes:
+      - consul_data:/consul/data
+      - ./consul_config:/consul/config
+    command: >
+      consul agent
+      -server
+      -bootstrap-expect=1
+      -ui
+      -client=0.0.0.0
+      -config-dir=/consul/config
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Backup and Disaster Recovery
+  backup-manager:
+    build:
+      context: ./backup_manager
+      dockerfile: Dockerfile
+    container_name: msp-backup-manager
+    environment:
+      - DB_PRIMARY_HOST=postgres-primary
+      - DB_USER=msp_admin
+      - DB_PASSWORD=${DB_PASSWORD}
+      - BACKUP_SCHEDULE=${BACKUP_SCHEDULE:-0 2 * * *}
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - S3_BUCKET=${BACKUP_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - backup_data:/backups
+      - ./backup_scripts:/scripts
+    depends_on:
+      - postgres-primary
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+
+  # Database Performance Monitoring
+  pg-monitor:
+    image: prometheuscommunity/postgres-exporter
+    container_name: msp-pg-monitor
+    environment:
+      - DATA_SOURCE_NAME=postgresql://msp_admin:${DB_PASSWORD}@postgres-primary:5432/msp_enterprise?sslmode=disable
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres-primary
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+
+  # Redis Monitoring
+  redis-exporter:
+    image: oliver006/redis_exporter
+    container_name: msp-redis-monitor
+    environment:
+      - REDIS_ADDR=redis://redis-node-1:7000
+      - REDIS_ADDR_2=redis://redis-node-2:7001  
+      - REDIS_ADDR_3=redis://redis-node-3:7002
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis-node-1
+      - redis-node-2
+      - redis-node-3
+    networks:
+      - msp_ha_network
+    restart: unless-stopped
+
+  # Database Migration and Schema Management
+  flyway:
+    image: flyway/flyway:9-alpine
+    container_name: msp-flyway
+    environment:
+      - FLYWAY_URL=jdbc:postgresql://postgres-primary:5432/msp_enterprise
+      - FLYWAY_USER=msp_admin
+      - FLYWAY_PASSWORD=${DB_PASSWORD}
+      - FLYWAY_SCHEMAS=public
+      - FLYWAY_BASELINE_ON_MIGRATE=true
+    volumes:
+      - ./migrations:/flyway/sql
+    depends_on:
+      - postgres-primary
+    networks:
+      - msp_ha_network
+    command: migrate
+
+networks:
+  msp_ha_network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_primary_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH}/postgres_primary
+      
+  postgres_replica1_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH}/postgres_replica1
+      
+  postgres_replica2_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH}/postgres_replica2
+      
+  redis_node1_data:
+  redis_node2_data:
+  redis_node3_data:
+  timescaledb_data:
+  influxdb_data:
+  influxdb_config:
+  clickhouse_data:
+  elasticsearch_data:
+  consul_data:
+  backup_data:
