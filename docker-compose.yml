@@ -1,0 +1,122 @@
+version: '3.8'
+
+services:
+  # Customer Support AI Service
+  customer-support:
+    build: ./customer-support/conversational-ai
+    ports:
+      - "8001:8000"
+    environment:
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SERVICENOW_URL=${SERVICENOW_URL}
+      - SERVICENOW_USER=${SERVICENOW_USER}
+      - SERVICENOW_PASS=${SERVICENOW_PASS}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - mcp-network
+
+  # Document Processing Service
+  document-processing:
+    build: ./document-processing/contract-analysis
+    ports:
+      - "8002:8000"
+    environment:
+      - AZURE_DOCUMENT_INTELLIGENCE_KEY=${AZURE_DOC_KEY}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - ./documents:/app/documents
+      - ./processed:/app/processed
+    networks:
+      - mcp-network
+
+  # Security & Compliance Service
+  compliance-security:
+    build: ./compliance-security/log-analysis
+    ports:
+      - "8003:8000"
+    environment:
+      - SPLUNK_HOST=${SPLUNK_HOST}
+      - SPLUNK_TOKEN=${SPLUNK_TOKEN}
+      - ELASTIC_HOST=${ELASTIC_HOST}
+      - ELASTIC_USER=${ELASTIC_USER}
+      - ELASTIC_PASS=${ELASTIC_PASS}
+    volumes:
+      - ./security-logs:/app/logs
+    networks:
+      - mcp-network
+
+  # System Operations Service
+  system-operations:
+    build: ./system-operations/monitoring-automation
+    ports:
+      - "8004:8000"
+    environment:
+      - PRTG_SERVER=${PRTG_SERVER}
+      - PRTG_USERNAME=${PRTG_USERNAME}
+      - PRTG_PASSHASH=${PRTG_PASSHASH}
+      - SOLARWINDS_API_KEY=${SOLARWINDS_API_KEY}
+    volumes:
+      - ./monitoring:/app/monitoring
+    networks:
+      - mcp-network
+
+  # SOP Automation Service
+  sop-automation:
+    build: ./sop-automation/process-creation
+    ports:
+      - "8005:8000"
+    environment:
+      - NOTION_TOKEN=${NOTION_TOKEN}
+      - CONFLUENCE_URL=${CONFLUENCE_URL}
+      - CONFLUENCE_USER=${CONFLUENCE_USER}
+      - CONFLUENCE_PASS=${CONFLUENCE_PASS}
+    volumes:
+      - ./sops:/app/sops
+    networks:
+      - mcp-network
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mcp-network
+
+  # MongoDB for document storage
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASS}
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - mcp-network
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - mcp-network
+
+volumes:
+  redis-data:
+  mongodb-data:
+  prometheus-data:
+
+networks:
+  mcp-network:
+    driver: bridge
